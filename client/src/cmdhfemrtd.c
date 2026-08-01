@@ -34,6 +34,11 @@
 #include "util_posix.h"             // msclock
 #include "ui.h"                     // search home directory
 #include "proxgui.h"                // Picture Window
+#include <mbedtls/aes.h>
+#include <mbedtls/cipher.h>
+#include <mbedtls/cmac.h>
+#include <mbedtls/ecdh.h>
+#include <mbedtls/ecp.h>
 
 // Max file size in bytes. Used in several places.
 // Average EF_DG2 seems to be around 20-25kB or so, but ICAO doesn't set an upper limit
@@ -50,10 +55,26 @@
 #define EMRTD_AID_MRTD {0xA0, 0x00, 0x00, 0x02, 0x47, 0x10, 0x01}
 
 #define EMRTD_KMAC_LEN              16
+#define EMRTD_PACE_AES256_KEY_LEN   32
+#define EMRTD_PACE_BP384_COORD_LEN  48
+#define EMRTD_PACE_BP384_PUB_LEN    (1 + (2 * EMRTD_PACE_BP384_COORD_LEN))
+#define EMRTD_PACE_SSC_LEN          16
+#define EMRTD_PACE_PASSWORD_MRZ     0x01
+#define EMRTD_PACE_PASSWORD_CAN     0x02
+#define EMRTD_INS_MSE               0x22
+#define EMRTD_INS_GENERAL_AUTH      0x86
 
 // DESKey Types
 static const uint8_t KENC_type[4] = {0x00, 0x00, 0x00, 0x01};
 static const uint8_t KMAC_type[4] = {0x00, 0x00, 0x00, 0x02};
+
+typedef enum {
+    EMRTD_SM_NONE = 0,
+    EMRTD_SM_BAC,
+    EMRTD_SM_PACE_AES
+} emrtd_sm_type_t;
+
+static emrtd_sm_type_t g_emrtd_sm_type = EMRTD_SM_NONE;
 
 /*
 * BAC = Basic Access Control
@@ -122,6 +143,7 @@ static int emrtd_print_ef_dg7_info(uint8_t *data, size_t datalen);
 static int emrtd_print_ef_dg11_info(uint8_t *data, size_t datalen);
 static int emrtd_print_ef_dg12_info(uint8_t *data, size_t datalen);
 static int emrtd_print_ef_cardaccess_info(uint8_t *data, size_t datalen);
+static bool emrtd_pace_aes256_cmac8(const uint8_t key[EMRTD_PACE_AES256_KEY_LEN], const uint8_t *input, size_t input_len, uint8_t mac8[8]);
 
 typedef enum  { // list must match dg_table
     EF_COM = 0,
@@ -145,6 +167,15 @@ typedef enum  { // list must match dg_table
     EF_CardAccess,
     EF_CardSecurity,
 } emrtd_dg_enum;
+
+typedef struct {
+    const emrtd_pacealg_t *alg;
+    uint8_t oid[10];
+    uint8_t oidlen;
+    uint8_t version;
+    uint8_t parameter_id;
+    bool has_parameter_id;
+} emrtd_pace_info_t;
 
 static emrtd_dg_t dg_table[] = {
 //  tag    dg# fileid  filename           desc                                                  pace   eac    req    fast   parser                          dumper
@@ -327,6 +358,56 @@ static int emrtd_get_asn1_field_length(uint8_t *datain, int datainlen, int offse
     return 0;
 }
 
+static size_t emrtd_tlv_put_len(uint8_t *out, size_t len) {
+    if (len <= 0x7F) {
+        out[0] = (uint8_t)len;
+        return 1;
+    }
+    out[0] = 0x81;
+    out[1] = (uint8_t)len;
+    return 2;
+}
+
+static bool emrtd_tlv_next(const uint8_t *data, size_t datalen, size_t *offset, uint16_t *tag, const uint8_t **value, size_t *value_len) {
+    if (*offset >= datalen) {
+        return false;
+    }
+
+    size_t pos = *offset;
+    *tag = data[pos++];
+    if ((*tag & 0x1F) == 0x1F) {
+        if (pos >= datalen) {
+            return false;
+        }
+        *tag = (*tag << 8) | data[pos++];
+    }
+
+    if (pos >= datalen) {
+        return false;
+    }
+
+    size_t len = data[pos++];
+    if ((len & 0x80) != 0) {
+        size_t lenlen = len & 0x7F;
+        if (lenlen == 0 || lenlen > 2 || pos + lenlen > datalen) {
+            return false;
+        }
+        len = 0;
+        for (size_t i = 0; i < lenlen; i++) {
+            len = (len << 8) | data[pos++];
+        }
+    }
+
+    if (pos + len > datalen) {
+        return false;
+    }
+
+    *value = data + pos;
+    *value_len = len;
+    *offset = pos + len;
+    return true;
+}
+
 static void des3_encrypt_cbc(uint8_t *iv, uint8_t *key, uint8_t *input, int inputlen, uint8_t *output) {
     mbedtls_des3_context ctx;
     mbedtls_des3_set2key_enc(&ctx, key);
@@ -366,6 +447,14 @@ static int pad_block(uint8_t *input, int inputlen, uint8_t *output) {
         output[inputlen + i] = padding[i];
     }
 
+    return inputlen + to_pad;
+}
+
+static int emrtd_pad_block_len(uint8_t *input, int inputlen, uint8_t *output, size_t blocklen) {
+    memcpy(output, input, inputlen);
+    int to_pad = blocklen - (inputlen % blocklen);
+    output[inputlen] = ISO9797_M2_PAD_BYTE;
+    memset(output + inputlen + 1, 0x00, to_pad - 1);
     return inputlen + to_pad;
 }
 
@@ -457,141 +546,239 @@ static int _emrtd_read_binary(int offset, int bytes_to_read, uint8_t *dataout, s
     return emrtd_exchange_commands((sAPDU_t) {0, ISO7816_READ_BINARY, offset >> 8, offset & 0xFF, 0, NULL}, true, bytes_to_read, dataout, maxdataoutlen, dataoutlen, false, true);
 }
 
+static size_t emrtd_sm_block_len(void) {
+    return g_emrtd_sm_type == EMRTD_SM_PACE_AES ? 16 : 8;
+}
+
+static size_t emrtd_sm_ssc_len(void) {
+    return g_emrtd_sm_type == EMRTD_SM_PACE_AES ? EMRTD_PACE_SSC_LEN : 8;
+}
+
 static void emrtd_bump_ssc(uint8_t *ssc) {
-    PrintAndLogEx(DEBUG, "ssc-b: %s", sprint_hex_inrow(ssc, 8));
-    for (int i = 7; i > 0; i--) {
+    size_t ssc_len = emrtd_sm_ssc_len();
+    PrintAndLogEx(DEBUG, "ssc-b: %s", sprint_hex_inrow(ssc, ssc_len));
+    for (int i = ssc_len - 1; i >= 0; i--) {
         if ((*(ssc + i)) == 0xFF) {
             // Set anything already FF to 0, we'll do + 1 on num to left anyways
             (*(ssc + i)) = 0;
         } else {
             (*(ssc + i)) += 1;
-            PrintAndLogEx(DEBUG, "ssc-a: %s", sprint_hex_inrow(ssc, 8));
+            PrintAndLogEx(DEBUG, "ssc-a: %s", sprint_hex_inrow(ssc, ssc_len));
             return;
         }
     }
 }
 
-static bool emrtd_check_cc(uint8_t *ssc, uint8_t *key, uint8_t *rapdu, int rapdulength) {
-    // https://elixi.re/i/clarkson.png
-    uint8_t k[500] = { 0x00 };
-    uint8_t cc[500] = { 0x00 };
-
-    emrtd_bump_ssc(ssc);
-
-    memcpy(k, ssc, 8);
-    int length = 0;
-    int length2 = 0;
-
-    if (*(rapdu) == 0x87) {
-        length += 2 + (*(rapdu + 1));
-        memcpy(k + 8, rapdu, length);
-        PrintAndLogEx(DEBUG, "len1: %i", length);
+static bool emrtd_sm_mac(uint8_t *key, uint8_t *input, size_t inputlen, uint8_t output[8]) {
+    if (g_emrtd_sm_type == EMRTD_SM_PACE_AES) {
+        uint8_t padded[600] = { 0x00 };
+        size_t padded_len = 0;
+        uint8_t mac[16] = { 0x00 };
+        AddISO9797M2Padding(padded, &padded_len, input, inputlen, 16);
+        if (emrtd_pace_aes256_cmac8(key, padded, padded_len, mac) == false) {
+            return false;
+        }
+        memcpy(output, mac, 8);
+        return true;
     }
 
-    if ((*(rapdu + length)) == 0x99) {
-        length2 += 2 + (*(rapdu + (length + 1)));
-        memcpy(k + length + 8, rapdu + length, length2);
-        PrintAndLogEx(DEBUG, "len2: %i", length2);
-    }
-
-    int klength = length + length2 + 8;
-
-    retail_mac(key, k, klength, cc);
-    PrintAndLogEx(DEBUG, "cc: %s", sprint_hex_inrow(cc, 8));
-    PrintAndLogEx(DEBUG, "rapdu: %s", sprint_hex_inrow(rapdu, rapdulength));
-    PrintAndLogEx(DEBUG, "rapdu cut: %s", sprint_hex_inrow(rapdu + (rapdulength - 8), 8));
-    PrintAndLogEx(DEBUG, "k: %s", sprint_hex_inrow(k, klength));
-
-    return memcmp(cc, rapdu + (rapdulength - 8), 8) == 0;
+    retail_mac(key, input, inputlen, output);
+    return true;
 }
 
-static bool emrtd_secure_select_file_by_ef(uint8_t *kenc, uint8_t *kmac, uint8_t *ssc, uint16_t file) {
+static bool emrtd_sm_iv(uint8_t *kenc, uint8_t *ssc, uint8_t iv[16]) {
+    memset(iv, 0x00, 16);
+    if (g_emrtd_sm_type != EMRTD_SM_PACE_AES) {
+        return true;
+    }
+
+    mbedtls_aes_context aes;
+    int ret = 0;
+    mbedtls_aes_init(&aes);
+    ret = mbedtls_aes_setkey_enc(&aes, kenc, 256);
+    if (ret == 0) {
+        ret = mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, ssc, iv);
+    }
+    mbedtls_aes_free(&aes);
+    return ret == 0;
+}
+
+static bool emrtd_check_cc(uint8_t *ssc, uint8_t *key, uint8_t *rapdu, int rapdulength) {
+    uint8_t k[700] = { 0x00 };
+    uint8_t cc[8] = { 0x00 };
+    size_t ssc_len = emrtd_sm_ssc_len();
+    size_t offset = 0;
+    const uint8_t *do8e = NULL;
+    size_t do8e_len = 0;
+    size_t klength = ssc_len;
+
+    if (rapdulength <= 0) {
+        return false;
+    }
+    emrtd_bump_ssc(ssc);
+    memcpy(k, ssc, ssc_len);
+
+    while (offset < (size_t)rapdulength) {
+        size_t tlv_start = offset;
+        uint16_t tag = 0;
+        const uint8_t *value = NULL;
+        size_t value_len = 0;
+        if (emrtd_tlv_next(rapdu, rapdulength, &offset, &tag, &value, &value_len) == false) {
+            return false;
+        }
+        if (tag == 0x8E) {
+            do8e = value;
+            do8e_len = value_len;
+            break;
+        }
+        if (tag == 0x87 || tag == 0x99) {
+            size_t tlv_len = offset - tlv_start;
+            memcpy(k + klength, rapdu + tlv_start, tlv_len);
+            klength += tlv_len;
+        }
+    }
+
+    if (do8e == NULL || do8e_len != 8) {
+        return false;
+    }
+
+    if (emrtd_sm_mac(key, k, klength, cc) == false) {
+        return false;
+    }
+    PrintAndLogEx(DEBUG, "cc: %s", sprint_hex_inrow(cc, 8));
+    PrintAndLogEx(DEBUG, "rapdu: %s", sprint_hex_inrow(rapdu, rapdulength));
+    PrintAndLogEx(DEBUG, "rapdu mac: %s", sprint_hex_inrow(do8e, do8e_len));
+    PrintAndLogEx(DEBUG, "k: %s", sprint_hex_inrow(k, klength));
+
+    return memcmp(cc, do8e, 8) == 0;
+}
+
+static bool emrtd_secure_select_file(uint8_t *kenc, uint8_t *kmac, uint8_t *ssc, uint8_t p1, uint8_t p2, const uint8_t *select_data, size_t select_data_len) {
     uint8_t response[PM3_CMD_DATA_SIZE] = { 0x00 };
     size_t resplen = 0;
+    size_t block_len = emrtd_sm_block_len();
+    size_t ssc_len = emrtd_sm_ssc_len();
 
-    // convert fileid to bytes
-    uint8_t file_id[2] = { 0x00 };
-    _emrtd_convert_fileid(file, file_id);
+    uint8_t iv[16] = { 0x00 };
+    uint8_t cmd[16] = { 0x00 };
+    uint8_t data[64] = { 0x00 };
+    uint8_t encrypted[32] = { 0x00 };
+    uint8_t do87[36] = { 0x00 };
+    uint8_t m[64] = { 0x00 };
+    uint8_t n[96] = { 0x00 };
+    uint8_t temp[16] = {0x0c, ISO7816_SELECT_FILE, p1, p2};
+    size_t do87len = 0;
+    size_t do87valuelen = 0;
 
-    uint8_t iv[8] = { 0x00 };
-    uint8_t cmd[8] = { 0x00 };
-    uint8_t data[21] = { 0x00 };
-    uint8_t temp[8] = {0x0c, 0xa4, EMRTD_P1_SELECT_BY_EF, 0x0c};
-
-    int cmdlen = pad_block(temp, 4, cmd);
-    int datalen = pad_block(file_id, 2, data);
+    int cmdlen = emrtd_pad_block_len(temp, 4, cmd, block_len);
+    int datalen = emrtd_pad_block_len((uint8_t *)select_data, select_data_len, data, block_len);
     PrintAndLogEx(DEBUG, "cmd: %s", sprint_hex_inrow(cmd, cmdlen));
     PrintAndLogEx(DEBUG, "data: %s", sprint_hex_inrow(data, datalen));
 
-    des3_encrypt_cbc(iv, kenc, data, datalen, temp);
-    PrintAndLogEx(DEBUG, "temp: %s", sprint_hex_inrow(temp, datalen));
-    uint8_t do87[11] = {0x87, 0x09, 0x01};
-    memcpy(do87 + 3, temp, datalen);
-    PrintAndLogEx(DEBUG, "do87: %s", sprint_hex_inrow(do87, datalen + 3));
-
-    uint8_t m[19];
-    memcpy(m, cmd, cmdlen);
-    memcpy(m + cmdlen, do87, (datalen + 3));
-    PrintAndLogEx(DEBUG, "m: %s", sprint_hex_inrow(m, datalen + cmdlen + 3));
-
     emrtd_bump_ssc(ssc);
+    if (emrtd_sm_iv(kenc, ssc, iv) == false) {
+        return false;
+    }
 
-    uint8_t n[27];
-    memcpy(n, ssc, 8);
-    memcpy(n + 8, m, (cmdlen + datalen + 3));
-    PrintAndLogEx(DEBUG, "n: %s", sprint_hex_inrow(n, (cmdlen + datalen + 11)));
+    if (g_emrtd_sm_type == EMRTD_SM_PACE_AES) {
+        if (aes256_encode(iv, kenc, data, encrypted, datalen) != PM3_SUCCESS) {
+            return false;
+        }
+    } else {
+        des3_encrypt_cbc(iv, kenc, data, datalen, encrypted);
+    }
+    PrintAndLogEx(DEBUG, "encrypted: %s", sprint_hex_inrow(encrypted, datalen));
+
+    do87[do87len++] = 0x87;
+    do87valuelen = datalen + 1;
+    do87len += emrtd_tlv_put_len(do87 + do87len, do87valuelen);
+    do87[do87len++] = 0x01;
+    memcpy(do87 + do87len, encrypted, datalen);
+    do87len += datalen;
+    PrintAndLogEx(DEBUG, "do87: %s", sprint_hex_inrow(do87, do87len));
+
+    memcpy(m, cmd, cmdlen);
+    memcpy(m + cmdlen, do87, do87len);
+    PrintAndLogEx(DEBUG, "m: %s", sprint_hex_inrow(m, cmdlen + do87len));
+
+    memcpy(n, ssc, ssc_len);
+    memcpy(n + ssc_len, m, cmdlen + do87len);
+    PrintAndLogEx(DEBUG, "n: %s", sprint_hex_inrow(n, ssc_len + cmdlen + do87len));
 
     uint8_t cc[8];
-    retail_mac(kmac, n, (cmdlen + datalen + 11), cc);
+    if (emrtd_sm_mac(kmac, n, ssc_len + cmdlen + do87len, cc) == false) {
+        return false;
+    }
     PrintAndLogEx(DEBUG, "cc: %s", sprint_hex_inrow(cc, 8));
 
     uint8_t do8e[10] = {0x8E, 0x08};
     memcpy(do8e + 2, cc, 8);
     PrintAndLogEx(DEBUG, "do8e: %s", sprint_hex_inrow(do8e, 10));
 
-    int lc = datalen + 3 + 10;
+    int lc = do87len + 10;
     PrintAndLogEx(DEBUG, "lc: %i", lc);
 
-    memcpy(data, do87, datalen + 3);
-    memcpy(data + (datalen + 3), do8e, 10);
+    memcpy(data, do87, do87len);
+    memcpy(data + do87len, do8e, 10);
     PrintAndLogEx(DEBUG, "data: %s", sprint_hex_inrow(data, lc));
 
-    if (emrtd_exchange_commands((sAPDU_t) {0x0C, ISO7816_SELECT_FILE, EMRTD_P1_SELECT_BY_EF, 0x0C, lc, data}, true, 0, response, sizeof(response), &resplen, false, true) == false) {
+    uint16_t sw = 0;
+    int res = Iso7816ExchangeEx(CC_CONTACTLESS, false, true, (sAPDU_t) {0x0C, ISO7816_SELECT_FILE, p1, p2, lc, data}, true, 0, response, sizeof(response), &resplen, &sw);
+    if (res != PM3_SUCCESS || sw != ISO7816_OK) {
+        PrintAndLogEx(WARNING, "Secure SELECT p1/p2 %02X/%02X status.. " _YELLOW_("%04X") " (%s)", p1, p2, sw, GetAPDUCodeDescription(sw >> 8, sw & 0xff));
         return false;
     }
 
-    return emrtd_check_cc(ssc, kmac, response, resplen);
+    if (emrtd_check_cc(ssc, kmac, response, resplen) == false) {
+        PrintAndLogEx(WARNING, "Secure SELECT response MAC check failed.");
+        return false;
+    }
+    return true;
+}
+
+static bool emrtd_secure_select_file_by_name(uint8_t *kenc, uint8_t *kmac, uint8_t *ssc, uint8_t namelen, uint8_t *name) {
+    return emrtd_secure_select_file(kenc, kmac, ssc, EMRTD_P1_SELECT_BY_NAME, EMRTD_P2_PROPRIETARY, name, namelen);
+}
+
+static bool emrtd_secure_select_file_by_ef(uint8_t *kenc, uint8_t *kmac, uint8_t *ssc, uint16_t file) {
+    uint8_t file_id[2] = { 0x00 };
+    _emrtd_convert_fileid(file, file_id);
+    return emrtd_secure_select_file(kenc, kmac, ssc, EMRTD_P1_SELECT_BY_EF, EMRTD_P2_PROPRIETARY, file_id, sizeof(file_id));
 }
 
 static bool _emrtd_secure_read_binary(uint8_t *kmac, uint8_t *ssc, int offset, int bytes_to_read, uint8_t *dataout, size_t maxdataoutlen, size_t *dataoutlen) {
-    uint8_t cmd[8] = { 0x00 };
-    uint8_t data[21] = { 0x00 };
-    uint8_t temp[8] = {0x0c, 0xb0};
+    size_t block_len = emrtd_sm_block_len();
+    size_t ssc_len = emrtd_sm_ssc_len();
+    uint8_t cmd[16] = { 0x00 };
+    uint8_t data[32] = { 0x00 };
+    uint8_t temp[16] = {0x0c, 0xb0};
 
-    PrintAndLogEx(DEBUG, "kmac: %s", sprint_hex_inrow(kmac, EMRTD_KMAC_LEN));
+    PrintAndLogEx(DEBUG, "kmac: %s", sprint_hex_inrow(kmac, g_emrtd_sm_type == EMRTD_SM_PACE_AES ? EMRTD_PACE_AES256_KEY_LEN : EMRTD_KMAC_LEN));
 
     // Set p1 and p2
     temp[2] = (uint8_t)(offset >> 8);
     temp[3] = (uint8_t)(offset >> 0);
 
-    int cmdlen = pad_block(temp, 4, cmd);
+    int cmdlen = emrtd_pad_block_len(temp, 4, cmd, block_len);
     PrintAndLogEx(DEBUG, "cmd: %s", sprint_hex_inrow(cmd, cmdlen));
 
     uint8_t do97[3] = {0x97, 0x01, bytes_to_read};
 
-    uint8_t m[11] = { 0x00 };
-    memcpy(m, cmd, 8);
-    memcpy(m + 8, do97, 3);
+    uint8_t m[32] = { 0x00 };
+    memcpy(m, cmd, cmdlen);
+    memcpy(m + cmdlen, do97, 3);
 
     emrtd_bump_ssc(ssc);
 
-    uint8_t n[19] = { 0x00 };
-    memcpy(n, ssc, 8);
-    memcpy(n + 8, m, 11);
-    PrintAndLogEx(DEBUG, "n: %s", sprint_hex_inrow(n, sizeof(n)));
+    uint8_t n[64] = { 0x00 };
+    memcpy(n, ssc, ssc_len);
+    memcpy(n + ssc_len, m, cmdlen + 3);
+    PrintAndLogEx(DEBUG, "n: %s", sprint_hex_inrow(n, ssc_len + cmdlen + 3));
 
     uint8_t cc[8] = { 0x00 };
-    retail_mac(kmac, n, 19, cc);
+    if (emrtd_sm_mac(kmac, n, ssc_len + cmdlen + 3, cc) == false) {
+        return false;
+    }
     PrintAndLogEx(DEBUG, "cc: %s", sprint_hex_inrow(cc, sizeof(cc)));
 
     uint8_t do8e[10] = {0x8E, 0x08};
@@ -615,8 +802,8 @@ static bool _emrtd_secure_read_binary(uint8_t *kmac, uint8_t *ssc, int offset, i
 static bool _emrtd_secure_read_binary_decrypt(uint8_t *kenc, uint8_t *kmac, uint8_t *ssc, int offset, int bytes_to_read, uint8_t *dataout, size_t *dataoutlen) {
     uint8_t response[500] = { 0x00 };
     uint8_t temp[500] = { 0x00 };
-    size_t resplen, cutat = 0;
-    uint8_t iv[8] = { 0x00 };
+    size_t resplen = 0;
+    uint8_t iv[16] = { 0x00 };
 
     if (_emrtd_secure_read_binary(kmac, ssc, offset, bytes_to_read, response, sizeof(response), &resplen) == false) {
         return false;
@@ -624,13 +811,50 @@ static bool _emrtd_secure_read_binary_decrypt(uint8_t *kenc, uint8_t *kmac, uint
 
     PrintAndLogEx(DEBUG, "secreadbindec, offset %i on read %i: encrypted: %s", offset, bytes_to_read, sprint_hex_inrow(response, resplen));
 
-    cutat = ((int) response[1]) - 1;
+    size_t tlvoffset = 0;
+    const uint8_t *do87 = NULL;
+    size_t do87_len = 0;
+    while (tlvoffset < resplen) {
+        uint16_t tag = 0;
+        const uint8_t *value = NULL;
+        size_t value_len = 0;
+        if (emrtd_tlv_next(response, resplen, &tlvoffset, &tag, &value, &value_len) == false) {
+            return false;
+        }
+        if (tag == 0x87) {
+            do87 = value;
+            do87_len = value_len;
+            break;
+        }
+    }
 
-    des3_decrypt_cbc(iv, kenc, response + 3, cutat, temp);
-    memcpy(dataout, temp, bytes_to_read);
-    PrintAndLogEx(DEBUG, "secreadbindec, offset %i on read %i: decrypted: %s", offset, bytes_to_read, sprint_hex_inrow(temp, cutat));
-    PrintAndLogEx(DEBUG, "secreadbindec, offset %i on read %i: decrypted and cut: %s", offset, bytes_to_read, sprint_hex_inrow(dataout, bytes_to_read));
-    *dataoutlen = bytes_to_read;
+    if (do87 == NULL || do87_len < 2 || do87[0] != 0x01) {
+        return false;
+    }
+
+    size_t encrypted_len = do87_len - 1;
+    if (emrtd_sm_iv(kenc, ssc, iv) == false) {
+        return false;
+    }
+    if (g_emrtd_sm_type == EMRTD_SM_PACE_AES) {
+        if (aes256_decode(iv, kenc, (uint8_t *)do87 + 1, temp, encrypted_len) != PM3_SUCCESS) {
+            return false;
+        }
+    } else {
+        des3_decrypt_cbc(iv, kenc, (uint8_t *)do87 + 1, encrypted_len, temp);
+    }
+
+    size_t plain_len = FindISO9797M2PaddingDataLen(temp, encrypted_len);
+    if (plain_len == 0 && bytes_to_read != 0) {
+        return false;
+    }
+    if (plain_len > (size_t)bytes_to_read) {
+        plain_len = bytes_to_read;
+    }
+    memcpy(dataout, temp, plain_len);
+    PrintAndLogEx(DEBUG, "secreadbindec, offset %i on read %i: decrypted: %s", offset, bytes_to_read, sprint_hex_inrow(temp, encrypted_len));
+    PrintAndLogEx(DEBUG, "secreadbindec, offset %i on read %i: decrypted and cut: %s", offset, bytes_to_read, sprint_hex_inrow(dataout, plain_len));
+    *dataoutlen = plain_len;
     return true;
 }
 
@@ -743,6 +967,578 @@ static bool emrtd_lds_get_data_by_tag(uint8_t *datain, size_t datainlen, uint8_t
     }
     // Return false if we can't find the relevant element
     return false;
+}
+
+static bool emrtd_pace_parse_info(uint8_t *cardaccess, size_t cardaccess_len, emrtd_pace_info_t *pace_info) {
+    memset(pace_info, 0, sizeof(*pace_info));
+
+    for (size_t set_index = 0;; set_index++) {
+        uint8_t dataset[100] = { 0x00 };
+        size_t datasetlen = 0;
+        uint8_t datafromtag[100] = { 0x00 };
+        size_t datafromtaglen = 0;
+
+        if (emrtd_lds_get_data_by_tag(cardaccess, cardaccess_len, dataset, &datasetlen, 0x30, 0x00, false, true, set_index) == false) {
+            return false;
+        }
+
+        if (emrtd_lds_get_data_by_tag(dataset, datasetlen, datafromtag, &datafromtaglen, 0x06, 0x00, false, false, 0) == false) {
+            continue;
+        }
+
+        for (int pacei = 0; pacealg_table[pacei].name != NULL; pacei++) {
+            if (datafromtaglen == sizeof(pacealg_table[pacei].descriptor) &&
+                    memcmp(pacealg_table[pacei].descriptor, datafromtag, datafromtaglen) == 0) {
+                pace_info->alg = &pacealg_table[pacei];
+                pace_info->oidlen = datafromtaglen;
+                memcpy(pace_info->oid, datafromtag, datafromtaglen);
+                break;
+            }
+        }
+
+        if (pace_info->alg == NULL) {
+            continue;
+        }
+
+        if (emrtd_lds_get_data_by_tag(dataset, datasetlen, datafromtag, &datafromtaglen, 0x02, 0x00, false, false, 0) == false || datafromtaglen != 1) {
+            memset(pace_info, 0, sizeof(*pace_info));
+            continue;
+        }
+        pace_info->version = datafromtag[0];
+
+        if (emrtd_lds_get_data_by_tag(dataset, datasetlen, datafromtag, &datafromtaglen, 0x02, 0x00, false, false, 1) == true && datafromtaglen == 1) {
+            pace_info->parameter_id = datafromtag[0];
+            pace_info->has_parameter_id = true;
+        }
+
+        return true;
+    }
+}
+
+static bool emrtd_pace_mse_set_at(const emrtd_pace_info_t *pace_info, uint8_t password_ref) {
+    uint8_t response[PM3_CMD_DATA_SIZE] = { 0x00 };
+    size_t resplen = 0;
+    uint8_t data[32] = { 0x00 };
+    size_t datalen = 0;
+    uint16_t sw = 0;
+
+    data[datalen++] = 0x80;
+    data[datalen++] = pace_info->oidlen;
+    memcpy(data + datalen, pace_info->oid, pace_info->oidlen);
+    datalen += pace_info->oidlen;
+
+    data[datalen++] = 0x83;
+    data[datalen++] = 0x01;
+    data[datalen++] = password_ref;
+
+    if (pace_info->has_parameter_id) {
+        data[datalen++] = 0x84;
+        data[datalen++] = 0x01;
+        data[datalen++] = pace_info->parameter_id;
+    }
+
+    PrintAndLogEx(DEBUG, "PACE MSE:Set AT data... %s", sprint_hex_inrow(data, datalen));
+
+    int res = Iso7816ExchangeEx(CC_CONTACTLESS, false, true, (sAPDU_t) {0x00, EMRTD_INS_MSE, 0xC1, 0xA4, datalen, data}, false, 0, response, sizeof(response), &resplen, &sw);
+    if (res != PM3_SUCCESS || sw != ISO7816_OK) {
+        PrintAndLogEx(WARNING, "PACE MSE:Set AT status.. " _YELLOW_("%04X") " (%s)", sw, GetAPDUCodeDescription(sw >> 8, sw & 0xff));
+        return false;
+    }
+    return true;
+}
+
+static bool emrtd_pace_get_encrypted_nonce(uint8_t *nonce, size_t maxnonce_len, size_t *nonce_len) {
+    uint8_t response[PM3_CMD_DATA_SIZE] = { 0x00 };
+    size_t resplen = 0;
+    uint8_t data[2] = {0x7C, 0x00};
+    *nonce_len = 0;
+
+    if (emrtd_exchange_commands((sAPDU_t) {0x10, EMRTD_INS_GENERAL_AUTH, 0x00, 0x00, sizeof(data), data}, true, 0, response, sizeof(response), &resplen, false, true) == false) {
+        return false;
+    }
+
+    if (resplen < 4 || response[0] != 0x7C || response[2] != 0x80) {
+        PrintAndLogEx(ERR, "PACE Get Nonce response did not contain encrypted nonce tag 80.");
+        return false;
+    }
+
+    size_t len = response[3];
+    if (len > maxnonce_len || len + 4 > resplen) {
+        PrintAndLogEx(ERR, "PACE encrypted nonce is too large (%zu bytes).", len);
+        return false;
+    }
+
+    memcpy(nonce, response + 4, len);
+    *nonce_len = len;
+    return true;
+}
+
+static bool emrtd_tlv_find_inner(const uint8_t *data, size_t datalen, uint16_t expected_tag, const uint8_t **value, size_t *value_len) {
+    size_t offset = 0;
+    uint16_t outer_tag = 0;
+    const uint8_t *outer_value = NULL;
+    size_t outer_len = 0;
+
+    if (emrtd_tlv_next(data, datalen, &offset, &outer_tag, &outer_value, &outer_len) == false || outer_tag != 0x7C) {
+        return false;
+    }
+
+    offset = 0;
+    while (offset < outer_len) {
+        uint16_t tag = 0;
+        if (emrtd_tlv_next(outer_value, outer_len, &offset, &tag, value, value_len) == false) {
+            return false;
+        }
+        if (tag == expected_tag) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool emrtd_pace_general_auth(uint8_t cla, uint8_t send_tag, const uint8_t *send_value, size_t send_value_len,
+                                    uint8_t expected_tag, uint8_t *recv_value, size_t max_recv_value_len, size_t *recv_value_len) {
+    uint8_t response[PM3_CMD_DATA_SIZE] = { 0x00 };
+    size_t resplen = 0;
+    uint8_t inner[140] = { 0x00 };
+    uint8_t data[150] = { 0x00 };
+    size_t inner_len = 0;
+    size_t datalen = 0;
+    uint16_t sw = 0;
+
+    *recv_value_len = 0;
+
+    inner[inner_len++] = send_tag;
+    inner_len += emrtd_tlv_put_len(inner + inner_len, send_value_len);
+    memcpy(inner + inner_len, send_value, send_value_len);
+    inner_len += send_value_len;
+
+    data[datalen++] = 0x7C;
+    datalen += emrtd_tlv_put_len(data + datalen, inner_len);
+    memcpy(data + datalen, inner, inner_len);
+    datalen += inner_len;
+
+    int res = Iso7816ExchangeEx(CC_CONTACTLESS, false, true, (sAPDU_t) {cla, EMRTD_INS_GENERAL_AUTH, 0x00, 0x00, datalen, data}, true, 0, response, sizeof(response), &resplen, &sw);
+    if (res != PM3_SUCCESS || sw != ISO7816_OK) {
+        PrintAndLogEx(WARNING, "PACE General Authenticate tag %02X status.. " _YELLOW_("%04X") " (%s)", send_tag, sw, GetAPDUCodeDescription(sw >> 8, sw & 0xff));
+        return false;
+    }
+
+    const uint8_t *value = NULL;
+    size_t value_len = 0;
+    if (emrtd_tlv_find_inner(response, resplen, expected_tag, &value, &value_len) == false) {
+        PrintAndLogEx(ERR, "PACE General Authenticate response did not contain tag %02X.", expected_tag);
+        return false;
+    }
+    if (value_len > max_recv_value_len) {
+        PrintAndLogEx(ERR, "PACE General Authenticate tag %02X is too large (%zu bytes).", expected_tag, value_len);
+        return false;
+    }
+
+    memcpy(recv_value, value, value_len);
+    *recv_value_len = value_len;
+    return true;
+}
+
+static bool emrtd_pace_sha256_kdf(const uint8_t *input, size_t input_len, uint32_t counter, uint8_t *key, size_t key_len) {
+    uint8_t buf[128] = { 0x00 };
+    uint8_t digest[32] = { 0x00 };
+
+    if (input_len + 4 > sizeof(buf) || key_len > sizeof(digest)) {
+        return false;
+    }
+
+    memcpy(buf, input, input_len);
+    buf[input_len + 0] = (counter >> 24) & 0xFF;
+    buf[input_len + 1] = (counter >> 16) & 0xFF;
+    buf[input_len + 2] = (counter >> 8) & 0xFF;
+    buf[input_len + 3] = counter & 0xFF;
+
+    if (sha256hash(buf, input_len + 4, digest) != PM3_SUCCESS) {
+        return false;
+    }
+
+    memcpy(key, digest, key_len);
+    return true;
+}
+
+static bool emrtd_pace_aes256_ecb_decrypt(const uint8_t key[EMRTD_PACE_AES256_KEY_LEN], const uint8_t enc[16], uint8_t out[16]) {
+    mbedtls_aes_context aes;
+    int ret = 0;
+
+    mbedtls_aes_init(&aes);
+    ret = mbedtls_aes_setkey_dec(&aes, key, 256);
+    if (ret == 0) {
+        ret = mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_DECRYPT, enc, out);
+    }
+    mbedtls_aes_free(&aes);
+    return ret == 0;
+}
+
+static bool emrtd_pace_aes256_cmac8(const uint8_t key[EMRTD_PACE_AES256_KEY_LEN], const uint8_t *input, size_t input_len, uint8_t mac8[8]) {
+    uint8_t mac[16] = { 0x00 };
+    const mbedtls_cipher_info_t *cipher_info = mbedtls_cipher_info_from_type(MBEDTLS_CIPHER_AES_256_ECB);
+    if (cipher_info == NULL || mbedtls_cipher_cmac(cipher_info, key, 256, input, input_len, mac) != 0) {
+        return false;
+    }
+    memcpy(mac8, mac, 8);
+    return true;
+}
+
+static bool emrtd_pace_export_pubkey(const mbedtls_ecp_group *grp, const mbedtls_ecp_point *point, uint8_t out[EMRTD_PACE_BP384_PUB_LEN]) {
+    size_t out_len = 0;
+    return mbedtls_ecp_point_write_binary(grp, point, MBEDTLS_ECP_PF_UNCOMPRESSED,
+                                          &out_len, out, EMRTD_PACE_BP384_PUB_LEN) == 0 &&
+           out_len == EMRTD_PACE_BP384_PUB_LEN;
+}
+
+static bool emrtd_pace_read_pubkey(const mbedtls_ecp_group *grp, const uint8_t *in, size_t in_len, mbedtls_ecp_point *point) {
+    return in_len == EMRTD_PACE_BP384_PUB_LEN &&
+           in[0] == 0x04 &&
+           mbedtls_ecp_point_read_binary(grp, point, in, in_len) == 0 &&
+           mbedtls_ecp_check_pubkey(grp, point) == 0;
+}
+
+static bool emrtd_pace_normalize_point(const mbedtls_ecp_group *grp, const mbedtls_ecp_point *in, mbedtls_ecp_point *out) {
+    uint8_t encoded[EMRTD_PACE_BP384_PUB_LEN] = { 0x00 };
+    return emrtd_pace_export_pubkey(grp, in, encoded) &&
+           mbedtls_ecp_point_read_binary(grp, out, encoded, sizeof(encoded)) == 0;
+}
+
+static bool emrtd_pace_affine_add(const mbedtls_ecp_group *grp, const mbedtls_ecp_point *p, const mbedtls_ecp_point *q, mbedtls_ecp_point *r) {
+    bool ok = false;
+    mbedtls_mpi lambda;
+    mbedtls_mpi numerator;
+    mbedtls_mpi denominator;
+    mbedtls_mpi inverse;
+    mbedtls_mpi tmp;
+
+    mbedtls_mpi_init(&lambda);
+    mbedtls_mpi_init(&numerator);
+    mbedtls_mpi_init(&denominator);
+    mbedtls_mpi_init(&inverse);
+    mbedtls_mpi_init(&tmp);
+
+    if (mbedtls_mpi_cmp_mpi(&p->X, &q->X) == 0) {
+        PrintAndLogEx(ERR, "PACE affine add hit unsupported point doubling/infinity case.");
+        goto out;
+    }
+
+    if (mbedtls_mpi_sub_mpi(&numerator, &q->Y, &p->Y) != 0 ||
+            mbedtls_mpi_mod_mpi(&numerator, &numerator, &grp->P) != 0 ||
+            mbedtls_mpi_sub_mpi(&denominator, &q->X, &p->X) != 0 ||
+            mbedtls_mpi_mod_mpi(&denominator, &denominator, &grp->P) != 0 ||
+            mbedtls_mpi_inv_mod(&inverse, &denominator, &grp->P) != 0 ||
+            mbedtls_mpi_mul_mpi(&lambda, &numerator, &inverse) != 0 ||
+            mbedtls_mpi_mod_mpi(&lambda, &lambda, &grp->P) != 0) {
+        goto out;
+    }
+
+    if (mbedtls_mpi_mul_mpi(&r->X, &lambda, &lambda) != 0 ||
+            mbedtls_mpi_sub_mpi(&r->X, &r->X, &p->X) != 0 ||
+            mbedtls_mpi_sub_mpi(&r->X, &r->X, &q->X) != 0 ||
+            mbedtls_mpi_mod_mpi(&r->X, &r->X, &grp->P) != 0) {
+        goto out;
+    }
+
+    if (mbedtls_mpi_sub_mpi(&tmp, &p->X, &r->X) != 0 ||
+            mbedtls_mpi_mul_mpi(&tmp, &lambda, &tmp) != 0 ||
+            mbedtls_mpi_sub_mpi(&r->Y, &tmp, &p->Y) != 0 ||
+            mbedtls_mpi_mod_mpi(&r->Y, &r->Y, &grp->P) != 0 ||
+            mbedtls_mpi_lset(&r->Z, 1) != 0) {
+        goto out;
+    }
+
+    ok = mbedtls_ecp_check_pubkey(grp, r) == 0;
+
+out:
+    mbedtls_mpi_free(&tmp);
+    mbedtls_mpi_free(&inverse);
+    mbedtls_mpi_free(&denominator);
+    mbedtls_mpi_free(&numerator);
+    mbedtls_mpi_free(&lambda);
+    return ok;
+}
+
+static bool emrtd_pace_encode_auth_token_input(const emrtd_pace_info_t *pace_info, const uint8_t pubkey[EMRTD_PACE_BP384_PUB_LEN],
+                                               uint8_t *out, size_t max_out_len, size_t *out_len) {
+    uint8_t inner[128] = { 0x00 };
+    size_t inner_len = 0;
+    size_t pos = 0;
+
+    if (pace_info->oidlen > 32 ||
+            1 + 2 + pace_info->oidlen + 1 + 2 + EMRTD_PACE_BP384_PUB_LEN > sizeof(inner)) {
+        return false;
+    }
+
+    inner[inner_len++] = 0x06;
+    inner_len += emrtd_tlv_put_len(inner + inner_len, pace_info->oidlen);
+    memcpy(inner + inner_len, pace_info->oid, pace_info->oidlen);
+    inner_len += pace_info->oidlen;
+
+    inner[inner_len++] = 0x86;
+    inner_len += emrtd_tlv_put_len(inner + inner_len, EMRTD_PACE_BP384_PUB_LEN);
+    memcpy(inner + inner_len, pubkey, EMRTD_PACE_BP384_PUB_LEN);
+    inner_len += EMRTD_PACE_BP384_PUB_LEN;
+
+    if (inner_len + 4 > max_out_len) {
+        return false;
+    }
+
+    out[pos++] = 0x7F;
+    out[pos++] = 0x49;
+    pos += emrtd_tlv_put_len(out + pos, inner_len);
+    memcpy(out + pos, inner, inner_len);
+    pos += inner_len;
+    *out_len = pos;
+    return true;
+}
+
+static bool emrtd_pace_is_supported_suite(const emrtd_pace_info_t *pace_info) {
+    const uint8_t oid_ecdh_gm_aes_cmac_256[] = {0x04, 0x00, 0x7F, 0x00, 0x07, 0x02, 0x02, 0x04, 0x02, 0x04};
+    return pace_info->oidlen == sizeof(oid_ecdh_gm_aes_cmac_256) &&
+           memcmp(pace_info->oid, oid_ecdh_gm_aes_cmac_256, sizeof(oid_ecdh_gm_aes_cmac_256)) == 0 &&
+           pace_info->has_parameter_id &&
+           pace_info->parameter_id == 16;
+}
+
+static bool emrtd_pace_do_can_auth(const emrtd_pace_info_t *pace_info, const char *can,
+                                   uint8_t ks_enc[EMRTD_PACE_AES256_KEY_LEN], uint8_t ks_mac[EMRTD_PACE_AES256_KEY_LEN]) {
+    bool ok = false;
+    uint8_t kpi[EMRTD_PACE_AES256_KEY_LEN] = { 0x00 };
+    uint8_t enc_nonce[64] = { 0x00 };
+    size_t enc_nonce_len = 0;
+    uint8_t nonce[16] = { 0x00 };
+    uint8_t pcd_map_pub[EMRTD_PACE_BP384_PUB_LEN] = { 0x00 };
+    uint8_t icc_map_pub[EMRTD_PACE_BP384_PUB_LEN] = { 0x00 };
+    size_t icc_map_pub_len = 0;
+    uint8_t pcd_ka_pub[EMRTD_PACE_BP384_PUB_LEN] = { 0x00 };
+    uint8_t icc_ka_pub[EMRTD_PACE_BP384_PUB_LEN] = { 0x00 };
+    size_t icc_ka_pub_len = 0;
+    uint8_t shared_secret[EMRTD_PACE_BP384_COORD_LEN] = { 0x00 };
+    uint8_t token_input[140] = { 0x00 };
+    size_t token_input_len = 0;
+    uint8_t pcd_token[8] = { 0x00 };
+    uint8_t icc_token[8] = { 0x00 };
+    uint8_t expected_icc_token[8] = { 0x00 };
+    size_t icc_token_len = 0;
+
+    pcrypto_rng_t rng;
+    mbedtls_ecp_group grp;
+    mbedtls_ecp_group mapped_grp;
+    mbedtls_mpi map_d;
+    mbedtls_mpi ka_d;
+    mbedtls_mpi one;
+    mbedtls_ecp_point map_Q;
+    mbedtls_ecp_point icc_map_Q;
+    mbedtls_ecp_point H;
+    mbedtls_ecp_point H_affine;
+    mbedtls_ecp_point sG;
+    mbedtls_ecp_point sG_affine;
+    mbedtls_ecp_point mapped_G;
+    mbedtls_ecp_point ka_Q;
+    mbedtls_ecp_point icc_ka_Q;
+    mbedtls_ecp_point shared_point;
+
+    pcrypto_rng_init(&rng, (const uint8_t *)"emrtd-pace", strlen("emrtd-pace"));
+    mbedtls_ecp_group_init(&grp);
+    mbedtls_ecp_group_init(&mapped_grp);
+    mbedtls_mpi_init(&map_d);
+    mbedtls_mpi_init(&ka_d);
+    mbedtls_mpi_init(&one);
+    mbedtls_ecp_point_init(&map_Q);
+    mbedtls_ecp_point_init(&icc_map_Q);
+    mbedtls_ecp_point_init(&H);
+    mbedtls_ecp_point_init(&H_affine);
+    mbedtls_ecp_point_init(&sG);
+    mbedtls_ecp_point_init(&sG_affine);
+    mbedtls_ecp_point_init(&mapped_G);
+    mbedtls_ecp_point_init(&ka_Q);
+    mbedtls_ecp_point_init(&icc_ka_Q);
+    mbedtls_ecp_point_init(&shared_point);
+
+    if (rng.seeded == false) {
+        PrintAndLogEx(ERR, "PACE RNG initialization failed.");
+        goto out;
+    }
+
+    if (emrtd_pace_sha256_kdf((const uint8_t *)can, strlen(can), 3, kpi, sizeof(kpi)) == false) {
+        PrintAndLogEx(ERR, "PACE CAN key derivation failed.");
+        goto out;
+    }
+
+    if (emrtd_pace_get_encrypted_nonce(enc_nonce, sizeof(enc_nonce), &enc_nonce_len) == false || enc_nonce_len != 16) {
+        PrintAndLogEx(ERR, "PACE Get Nonce failed.");
+        goto out;
+    }
+    PrintAndLogEx(SUCCESS, "PACE encrypted nonce.... " _YELLOW_("%s"), sprint_hex_inrow(enc_nonce, enc_nonce_len));
+
+    if (emrtd_pace_aes256_ecb_decrypt(kpi, enc_nonce, nonce) == false) {
+        PrintAndLogEx(ERR, "PACE nonce decrypt failed.");
+        goto out;
+    }
+    PrintAndLogEx(SUCCESS, "PACE nonce decrypted.... " _YELLOW_("%s"), sprint_hex_inrow(nonce, sizeof(nonce)));
+
+    if (mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_BP384R1) != 0 ||
+            mbedtls_ecp_group_copy(&mapped_grp, &grp) != 0 ||
+            mbedtls_mpi_lset(&one, 1) != 0) {
+        PrintAndLogEx(ERR, "PACE BrainpoolP384r1 setup failed.");
+        goto out;
+    }
+
+    if (mbedtls_ecp_gen_keypair(&grp, &map_d, &map_Q, mbedtls_ctr_drbg_random, &rng.ctr_drbg) != 0 ||
+            emrtd_pace_export_pubkey(&grp, &map_Q, pcd_map_pub) == false) {
+        PrintAndLogEx(ERR, "PACE mapping key generation failed.");
+        goto out;
+    }
+
+    if (emrtd_pace_general_auth(0x10, 0x81, pcd_map_pub, sizeof(pcd_map_pub), 0x82,
+                                icc_map_pub, sizeof(icc_map_pub), &icc_map_pub_len) == false ||
+            emrtd_pace_read_pubkey(&grp, icc_map_pub, icc_map_pub_len, &icc_map_Q) == false) {
+        PrintAndLogEx(ERR, "PACE mapping public-key exchange failed.");
+        goto out;
+    }
+    PrintAndLogEx(SUCCESS, "PACE mapping exchange... " _YELLOW_("ok"));
+
+    if (mbedtls_ecp_mul(&grp, &H, &map_d, &icc_map_Q, mbedtls_ctr_drbg_random, &rng.ctr_drbg) != 0 ||
+            emrtd_pace_normalize_point(&grp, &H, &H_affine) == false ||
+            mbedtls_mpi_read_binary(&map_d, nonce, sizeof(nonce)) != 0 ||
+            mbedtls_ecp_mul(&grp, &sG, &map_d, &grp.G, mbedtls_ctr_drbg_random, &rng.ctr_drbg) != 0 ||
+            emrtd_pace_normalize_point(&grp, &sG, &sG_affine) == false ||
+            emrtd_pace_affine_add(&grp, &sG_affine, &H_affine, &mapped_G) == false) {
+        PrintAndLogEx(ERR, "PACE generic mapping failed.");
+        goto out;
+    }
+    PrintAndLogEx(SUCCESS, "PACE generic mapping.... " _YELLOW_("ok"));
+
+    if (mbedtls_ecp_gen_keypair_base(&grp, &mapped_G, &ka_d, &ka_Q, mbedtls_ctr_drbg_random, &rng.ctr_drbg) != 0 ||
+            emrtd_pace_export_pubkey(&grp, &ka_Q, pcd_ka_pub) == false) {
+        PrintAndLogEx(ERR, "PACE mapped key generation failed.");
+        goto out;
+    }
+
+    if (emrtd_pace_general_auth(0x10, 0x83, pcd_ka_pub, sizeof(pcd_ka_pub), 0x84,
+                                icc_ka_pub, sizeof(icc_ka_pub), &icc_ka_pub_len) == false ||
+            emrtd_pace_read_pubkey(&grp, icc_ka_pub, icc_ka_pub_len, &icc_ka_Q) == false) {
+        PrintAndLogEx(ERR, "PACE mapped public-key exchange failed.");
+        goto out;
+    }
+    PrintAndLogEx(SUCCESS, "PACE key agreement...... " _YELLOW_("ok"));
+
+    if (mbedtls_ecp_mul(&grp, &shared_point, &ka_d, &icc_ka_Q, mbedtls_ctr_drbg_random, &rng.ctr_drbg) != 0 ||
+            mbedtls_mpi_write_binary(&shared_point.X, shared_secret, sizeof(shared_secret)) != 0 ||
+            emrtd_pace_sha256_kdf(shared_secret, sizeof(shared_secret), 1, ks_enc, EMRTD_PACE_AES256_KEY_LEN) == false ||
+            emrtd_pace_sha256_kdf(shared_secret, sizeof(shared_secret), 2, ks_mac, EMRTD_PACE_AES256_KEY_LEN) == false) {
+        PrintAndLogEx(ERR, "PACE session key derivation failed.");
+        goto out;
+    }
+
+    if (emrtd_pace_encode_auth_token_input(pace_info, icc_ka_pub, token_input, sizeof(token_input), &token_input_len) == false ||
+            emrtd_pace_aes256_cmac8(ks_mac, token_input, token_input_len, pcd_token) == false) {
+        PrintAndLogEx(ERR, "PACE terminal token calculation failed.");
+        goto out;
+    }
+
+    if (emrtd_pace_general_auth(0x00, 0x85, pcd_token, sizeof(pcd_token), 0x86,
+                                icc_token, sizeof(icc_token), &icc_token_len) == false ||
+            icc_token_len != sizeof(icc_token)) {
+        PrintAndLogEx(ERR, "PACE mutual authentication token exchange failed.");
+        goto out;
+    }
+
+    if (emrtd_pace_encode_auth_token_input(pace_info, pcd_ka_pub, token_input, sizeof(token_input), &token_input_len) == false ||
+            emrtd_pace_aes256_cmac8(ks_mac, token_input, token_input_len, expected_icc_token) == false) {
+        PrintAndLogEx(ERR, "PACE card token calculation failed.");
+        goto out;
+    }
+
+    if (memcmp(icc_token, expected_icc_token, sizeof(expected_icc_token)) != 0) {
+        PrintAndLogEx(ERR, "PACE card authentication token mismatch.");
+        PrintAndLogEx(DEBUG, "PACE card token......... %s", sprint_hex_inrow(icc_token, sizeof(icc_token)));
+        PrintAndLogEx(DEBUG, "PACE expected token..... %s", sprint_hex_inrow(expected_icc_token, sizeof(expected_icc_token)));
+        goto out;
+    }
+
+    PrintAndLogEx(SUCCESS, "PACE mutual auth........ " _GREEN_("ok"));
+    ok = true;
+
+out:
+    mbedtls_ecp_point_free(&shared_point);
+    mbedtls_ecp_point_free(&icc_ka_Q);
+    mbedtls_ecp_point_free(&ka_Q);
+    mbedtls_ecp_point_free(&mapped_G);
+    mbedtls_ecp_point_free(&sG_affine);
+    mbedtls_ecp_point_free(&sG);
+    mbedtls_ecp_point_free(&H_affine);
+    mbedtls_ecp_point_free(&H);
+    mbedtls_ecp_point_free(&icc_map_Q);
+    mbedtls_ecp_point_free(&map_Q);
+    mbedtls_mpi_free(&one);
+    mbedtls_mpi_free(&ka_d);
+    mbedtls_mpi_free(&map_d);
+    mbedtls_ecp_group_free(&mapped_grp);
+    mbedtls_ecp_group_free(&grp);
+    pcrypto_rng_free(&rng);
+    memset(kpi, 0x00, sizeof(kpi));
+    memset(shared_secret, 0x00, sizeof(shared_secret));
+    memset(nonce, 0x00, sizeof(nonce));
+    if (ok == false) {
+        memset(ks_enc, 0x00, EMRTD_PACE_AES256_KEY_LEN);
+        memset(ks_mac, 0x00, EMRTD_PACE_AES256_KEY_LEN);
+    }
+    return ok;
+}
+
+static bool emrtd_probe_pace(uint8_t *cardaccess, size_t cardaccess_len, const char *can, bool mrz_available, const char *phase,
+                             uint8_t *ssc, uint8_t *ks_enc, uint8_t *ks_mac) {
+    emrtd_pace_info_t pace_info;
+
+    if (emrtd_pace_parse_info(cardaccess, cardaccess_len, &pace_info) == false) {
+        PrintAndLogEx(INFO, "PACE is advertised, but no supported PACEInfo was parsed.");
+        return false;
+    }
+
+    PrintAndLogEx(INFO, "PACE probe phase........ " _YELLOW_("%s"), phase);
+    PrintAndLogEx(INFO, "PACE candidate.......... " _YELLOW_("%s"), pace_info.alg->name);
+    if (pace_info.has_parameter_id) {
+        PrintAndLogEx(INFO, "PACE parameter id....... " _YELLOW_("%u"), pace_info.parameter_id);
+    }
+
+    uint8_t password_ref = EMRTD_PACE_PASSWORD_MRZ;
+    if (can != NULL && strlen(can) > 0) {
+        password_ref = EMRTD_PACE_PASSWORD_CAN;
+        PrintAndLogEx(INFO, "PACE password ref....... " _YELLOW_("CAN"));
+    } else if (mrz_available) {
+        PrintAndLogEx(INFO, "PACE password ref....... " _YELLOW_("MRZ (key derivation is not implemented yet)"));
+    } else {
+        PrintAndLogEx(INFO, "PACE password ref....... " _YELLOW_("MRZ (not available)"));
+    }
+
+    if (emrtd_pace_is_supported_suite(&pace_info) == false) {
+        PrintAndLogEx(ERR, "PACE crypto currently supports only ECDH-GM-AES-CMAC-256 with BrainpoolP384r1.");
+        return false;
+    }
+
+    if (password_ref != EMRTD_PACE_PASSWORD_CAN) {
+        PrintAndLogEx(ERR, "PACE crypto currently requires `" _YELLOW_("--can <CAN>") "`.");
+        return false;
+    }
+
+    if (emrtd_pace_mse_set_at(&pace_info, password_ref) == false) {
+        PrintAndLogEx(ERR, "PACE MSE:Set AT failed.");
+        if ((can == NULL || strlen(can) == 0) && mrz_available) {
+            PrintAndLogEx(HINT, "Hint: This card may require CAN-based PACE. Retry with `" _YELLOW_("--can <CAN>") "`.");
+        }
+        return false;
+    }
+
+    if (emrtd_pace_do_can_auth(&pace_info, can, ks_enc, ks_mac) == false) {
+        return false;
+    }
+
+    memset(ssc, 0x00, EMRTD_PACE_SSC_LEN);
+    g_emrtd_sm_type = EMRTD_SM_PACE_AES;
+    return true;
 }
 
 static bool emrtd_select_and_read(uint8_t *dataout, size_t *dataoutlen, uint16_t file, uint8_t *ks_enc, uint8_t *ks_mac, uint8_t *ssc, bool use_secure) {
@@ -1048,7 +1844,21 @@ static bool emrtd_connect(void) {
     return res == PM3_SUCCESS;
 }
 
-static bool emrtd_do_auth(char *documentnumber, char *dob, char *expiry, bool BAC_available, bool *BAC, uint8_t *ssc, uint8_t *ks_enc, uint8_t *ks_mac) {
+static bool emrtd_do_auth(char *documentnumber, char *dob, char *expiry, const char *can, bool BAC_available, uint8_t *cardaccess, size_t cardaccess_len, bool *BAC, uint8_t *ssc, uint8_t *ks_enc, uint8_t *ks_mac) {
+
+    if (cardaccess_len > 0) {
+        PrintAndLogEx(INFO, "PACE is available, probing PACE before selecting MRTD app");
+        if (emrtd_probe_pace(cardaccess, cardaccess_len, can, BAC_available, "MF / pre-application select", ssc, ks_enc, ks_mac)) {
+            *BAC = true;
+            uint8_t aid[] = EMRTD_AID_MRTD;
+            if (emrtd_secure_select_file_by_name(ks_enc, ks_mac, ssc, sizeof(aid), aid) == false) {
+                PrintAndLogEx(ERR, "PACE authentication succeeded, but protected MRTD application select failed.");
+                return false;
+            }
+            PrintAndLogEx(SUCCESS, "PACE secure messaging.. " _GREEN_("started"));
+            return true;
+        }
+    }
 
     // Select MRTD applet
     uint8_t aid[] = EMRTD_AID_MRTD;
@@ -1080,6 +1890,18 @@ static bool emrtd_do_auth(char *documentnumber, char *dob, char *expiry, bool BA
 
     // Do Basic Access Control
     if (*BAC) {
+        if (cardaccess_len > 0) {
+            PrintAndLogEx(INFO, "PACE is available, probing PACE before BAC");
+            if (emrtd_probe_pace(cardaccess, cardaccess_len, can, BAC_available, "MRTD application selected", ssc, ks_enc, ks_mac)) {
+                PrintAndLogEx(SUCCESS, "PACE secure messaging.. " _GREEN_("started"));
+                return true;
+            } else {
+                PrintAndLogEx(HINT, "Hint: This card likely requires PACE; BAC external authentication is expected to fail.");
+            }
+            PrintAndLogEx(ERR, "PACE probe failed; not falling back to BAC because EF.CardAccess advertises PACE.");
+            return false;
+        }
+
         // If BAC isn't available, exit out and warn user.
         if (BAC_available == false) {
             PrintAndLogEx(ERR, "This eMRTD enforces authentication, but you didn't supply MRZ data. Cannot proceed.");
@@ -1090,16 +1912,20 @@ static bool emrtd_do_auth(char *documentnumber, char *dob, char *expiry, bool BA
         if (emrtd_do_bac(documentnumber, dob, expiry, ssc, ks_enc, ks_mac) == false) {
             return false;
         }
+        g_emrtd_sm_type = EMRTD_SM_BAC;
     }
     return true;
 }
 
-int dumpHF_EMRTD(char *documentnumber, char *dob, char *expiry, bool BAC_available, const char *path) {
+int dumpHF_EMRTD(char *documentnumber, char *dob, char *expiry, const char *can, bool BAC_available, const char *path) {
     uint8_t response[EMRTD_MAX_FILE_SIZE] = { 0x00 };
     size_t resplen = 0;
-    uint8_t ssc[8] = { 0x00 };
-    uint8_t ks_enc[EMRTD_KMAC_LEN] = { 0x00 };
-    uint8_t ks_mac[EMRTD_KMAC_LEN] = { 0x00 };
+    uint8_t cardaccess[EMRTD_MAX_FILE_SIZE] = { 0x00 };
+    size_t cardaccess_len = 0;
+    uint8_t ssc[EMRTD_PACE_SSC_LEN] = { 0x00 };
+    uint8_t ks_enc[EMRTD_PACE_AES256_KEY_LEN] = { 0x00 };
+    uint8_t ks_mac[EMRTD_PACE_AES256_KEY_LEN] = { 0x00 };
+    g_emrtd_sm_type = EMRTD_SM_NONE;
     bool BAC = false;
 
     // Select the eMRTD
@@ -1109,13 +1935,32 @@ int dumpHF_EMRTD(char *documentnumber, char *dob, char *expiry, bool BAC_availab
     }
 
     // Dump EF_CardAccess (if available)
-    if (emrtd_dump_file(ks_enc, ks_mac, ssc, dg_table[EF_CardAccess].fileid, dg_table[EF_CardAccess].filename, BAC, path) == false) {
+    if (emrtd_select_and_read(cardaccess, &cardaccess_len, dg_table[EF_CardAccess].fileid, ks_enc, ks_mac, ssc, BAC) == false) {
         PrintAndLogEx(INFO, "Couldn't dump EF_CardAccess, card does not support PACE");
         PrintAndLogEx(HINT, "Hint: This is expected behavior for cards without PACE and isn't something to be worried about");
+    } else {
+        char *filepath = calloc(strlen(path) + 100, sizeof(char));
+        if (filepath == NULL) {
+            PrintAndLogEx(WARNING, "Failed to allocate memory");
+            DropField();
+            return PM3_EMALLOC;
+        }
+
+        strcpy(filepath, path);
+        strncat(filepath, PATHSEP, 2);
+        strcat(filepath, dg_table[EF_CardAccess].filename);
+
+        PrintAndLogEx(INFO, "Read " _YELLOW_("%s") ", len %zu", dg_table[EF_CardAccess].filename, cardaccess_len);
+        PrintAndLogEx(DEBUG, "Contents (may be incomplete over 2k chars)");
+        PrintAndLogEx(DEBUG, "------------------------------------------");
+        PrintAndLogEx(DEBUG, "%s", sprint_hex_inrow(cardaccess, cardaccess_len));
+        PrintAndLogEx(DEBUG, "------------------------------------------");
+        saveFile(filepath, ".bin", cardaccess, cardaccess_len);
+        free(filepath);
     }
 
     // Authenticate with the eMRTD
-    if (emrtd_do_auth(documentnumber, dob, expiry, BAC_available, &BAC, ssc, ks_enc, ks_mac) == false) {
+    if (emrtd_do_auth(documentnumber, dob, expiry, can, BAC_available, cardaccess, cardaccess_len, &BAC, ssc, ks_enc, ks_mac) == false) {
         DropField();
         return PM3_ESOFT;
     }
@@ -1987,12 +2832,15 @@ static int emrtd_print_ef_cardaccess_info(uint8_t *data, size_t datalen) {
     return PM3_SUCCESS;
 }
 
-int infoHF_EMRTD(char *documentnumber, char *dob, char *expiry, bool BAC_available, bool only_fast) {
+int infoHF_EMRTD(char *documentnumber, char *dob, char *expiry, const char *can, bool BAC_available, bool only_fast) {
     uint8_t response[EMRTD_MAX_FILE_SIZE] = { 0x00 };
     size_t resplen = 0;
-    uint8_t ssc[8] = { 0x00 };
-    uint8_t ks_enc[16] = { 0x00 };
-    uint8_t ks_mac[16] = { 0x00 };
+    uint8_t cardaccess[EMRTD_MAX_FILE_SIZE] = { 0x00 };
+    size_t cardaccess_len = 0;
+    uint8_t ssc[EMRTD_PACE_SSC_LEN] = { 0x00 };
+    uint8_t ks_enc[EMRTD_PACE_AES256_KEY_LEN] = { 0x00 };
+    uint8_t ks_mac[EMRTD_PACE_AES256_KEY_LEN] = { 0x00 };
+    g_emrtd_sm_type = EMRTD_SM_NONE;
     bool BAC = false;
     bool PACE_available = true;
 
@@ -2007,10 +2855,13 @@ int infoHF_EMRTD(char *documentnumber, char *dob, char *expiry, bool BAC_availab
     if (emrtd_select_and_read(response, &resplen, dg_table[EF_CardAccess].fileid, ks_enc, ks_mac, ssc, BAC) == false) {
         PACE_available = false;
         PrintAndLogEx(HINT, "Hint: The error above this is normal. It just means that your eMRTD lacks PACE.");
+    } else {
+        memcpy(cardaccess, response, resplen);
+        cardaccess_len = resplen;
     }
 
     // Select and authenticate with the eMRTD
-    bool auth_result = emrtd_do_auth(documentnumber, dob, expiry, BAC_available, &BAC, ssc, ks_enc, ks_mac);
+    bool auth_result = emrtd_do_auth(documentnumber, dob, expiry, can, BAC_available, cardaccess, cardaccess_len, &BAC, ssc, ks_enc, ks_mac);
 
     PrintAndLogEx(NORMAL, "");
     PrintAndLogEx(INFO, "---------------------- " _CYAN_("Basic Info") " ----------------------");
@@ -2228,6 +3079,26 @@ static bool validate_date(uint8_t *data, int datalen) {
     return !(day <= 0 || day > 31 || month <= 0 || month > 12);
 }
 
+static bool emrtd_extract_access_data_from_mrz(uint8_t *mrz, int mrzlen, uint8_t *docnum, uint8_t *dob, uint8_t *expiry) {
+    strn_upper((char *)mrz, mrzlen);
+
+    if (mrzlen == 44) {
+        memcpy(docnum, &mrz[0], 9);
+        memcpy(dob,    &mrz[13], 6);
+        memcpy(expiry, &mrz[21], 6);
+        return true;
+    }
+
+    if (mrzlen == 90) {
+        memcpy(docnum, &mrz[5], 9);
+        memcpy(dob,    &mrz[30], 6);
+        memcpy(expiry, &mrz[38], 6);
+        return true;
+    }
+
+    return false;
+}
+
 static int CmdHFeMRTDDump(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf emrtd dump",
@@ -2242,16 +3113,18 @@ static int CmdHFeMRTDDump(const char *Cmd) {
         arg_str0("n", "doc", "<alphanum>", "document number, up to 9 chars"),
         arg_str0("d", "date", "<YYMMDD>", "date of birth in YYMMDD format"),
         arg_str0("e", "expiry", "<YYMMDD>", "expiry in YYMMDD format"),
-        arg_str0("m", "mrz", "<[0-9A-Z<]>", "2nd line of MRZ, 44 chars"),
+        arg_str0("m", "mrz", "<[0-9A-Z<]>", "TD3 passport MRZ line 2 (44 chars) or full TD1 ID card MRZ (90 chars)"),
+        arg_str0("c", "can", "<digits>", "card access number for PACE"),
         arg_str0(NULL, "dir", "<str>", "save dump to the given dirpath"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
 
-    uint8_t mrz[45] = { 0x00 };
+    uint8_t mrz[91] = { 0x00 };
     uint8_t docnum[10] = { 0x00 };
     uint8_t dob[7] = { 0x00 };
     uint8_t expiry[7] = { 0x00 };
+    uint8_t can[16] = { 0x00 };
     bool BAC = true;
     bool error = false;
     int slen = 0;
@@ -2286,16 +3159,12 @@ static int CmdHFeMRTDDump(const char *Cmd) {
         }
     }
 
-    if (CLIParamStrToBuf(arg_get_str(ctx, 4), mrz, 44, &slen) == 0 && slen != 0) {
-        if (slen != 44) {
-            PrintAndLogEx(ERR, "MRZ length is incorrect, it should be 44, not %i", slen);
+    if (CLIParamStrToBuf(arg_get_str(ctx, 4), mrz, sizeof(mrz) - 1, &slen) == 0 && slen != 0) {
+        if (emrtd_extract_access_data_from_mrz(mrz, slen, docnum, dob, expiry) == false) {
+            PrintAndLogEx(ERR, "MRZ length is incorrect, it should be 44 (TD3 line 2) or 90 (full TD1), not %i", slen);
             error = true;
         } else {
             BAC = true;
-            strn_upper((char *)mrz, slen);
-            memcpy(docnum, &mrz[0], 9);
-            memcpy(dob,    &mrz[13], 6);
-            memcpy(expiry, &mrz[21], 6);
             // TODO check MRZ checksums?
             if (!validate_date(dob, 6)) {
                 PrintAndLogEx(ERR, "Date of birth date format is incorrect, cannot continue.");
@@ -2310,8 +3179,12 @@ static int CmdHFeMRTDDump(const char *Cmd) {
         }
     }
 
+    if (CLIParamStrToBuf(arg_get_str(ctx, 5), can, sizeof(can) - 1, &slen) == 0 && slen != 0) {
+        strn_upper((char *)can, slen);
+    }
+
     uint8_t path[FILENAME_MAX] = { 0x00 };
-    if (CLIParamStrToBuf(arg_get_str(ctx, 5), path, sizeof(path), &slen) != 0 || slen == 0) {
+    if (CLIParamStrToBuf(arg_get_str(ctx, 6), path, sizeof(path), &slen) != 0 || slen == 0) {
         path[0] = '.';
     }
 
@@ -2326,7 +3199,7 @@ static int CmdHFeMRTDDump(const char *Cmd) {
 
     uint64_t t1 = msclock();
 
-    int res = dumpHF_EMRTD((char *)docnum, (char *)dob, (char *)expiry, BAC, (const char *)path);
+    int res = dumpHF_EMRTD((char *)docnum, (char *)dob, (char *)expiry, (const char *)can, BAC, (const char *)path);
 
     PrintAndLogEx(SUCCESS, "time: %" PRIu64 " seconds\n", (msclock() - t1) / 1000);
 
@@ -2349,17 +3222,19 @@ static int CmdHFeMRTDInfo(const char *Cmd) {
         arg_str0("n", "doc", "<alphanum>", "document number, up to 9 chars"),
         arg_str0("d", "date", "<YYMMDD>", "date of birth in YYMMDD format"),
         arg_str0("e", "expiry", "<YYMMDD>", "expiry in YYMMDD format"),
-        arg_str0("m", "mrz", "<[0-9A-Z<]>", "2nd line of MRZ, 44 chars (passports only)"),
+        arg_str0("m", "mrz", "<[0-9A-Z<]>", "TD3 passport MRZ line 2 (44 chars) or full TD1 ID card MRZ (90 chars)"),
+        arg_str0("c", "can", "<digits>", "card access number for PACE"),
         arg_str0(NULL, "dir", "<str>", "display info from offline dump stored in dirpath"),
         arg_lit0("i", "images", "show images"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
 
-    uint8_t mrz[45] = { 0x00 };
+    uint8_t mrz[91] = { 0x00 };
     uint8_t docnum[10] = { 0x00 };
     uint8_t dob[7] = { 0x00 };
     uint8_t expiry[7] = { 0x00 };
+    uint8_t can[16] = { 0x00 };
     bool BAC = true;
     bool error = false;
     int slen = 0;
@@ -2393,16 +3268,12 @@ static int CmdHFeMRTDInfo(const char *Cmd) {
         }
     }
 
-    if (CLIParamStrToBuf(arg_get_str(ctx, 4), mrz, 44, &slen) == 0 && slen != 0) {
-        if (slen != 44) {
-            PrintAndLogEx(ERR, "MRZ length is incorrect, it should be 44, not %i", slen);
+    if (CLIParamStrToBuf(arg_get_str(ctx, 4), mrz, sizeof(mrz) - 1, &slen) == 0 && slen != 0) {
+        if (emrtd_extract_access_data_from_mrz(mrz, slen, docnum, dob, expiry) == false) {
+            PrintAndLogEx(ERR, "MRZ length is incorrect, it should be 44 (TD3 line 2) or 90 (full TD1), not %i", slen);
             error = true;
         } else {
             BAC = true;
-            strn_upper((char *)mrz, slen);
-            memcpy(docnum, &mrz[0], 9);
-            memcpy(dob,    &mrz[13], 6);
-            memcpy(expiry, &mrz[21], 6);
             // TODO check MRZ checksums?
             if (!validate_date(dob, 6)) {
                 PrintAndLogEx(ERR, "Date of birth date format is incorrect, cannot continue.");
@@ -2416,9 +3287,14 @@ static int CmdHFeMRTDInfo(const char *Cmd) {
             }
         }
     }
+
+    if (CLIParamStrToBuf(arg_get_str(ctx, 5), can, sizeof(can) - 1, &slen) == 0 && slen != 0) {
+        strn_upper((char *)can, slen);
+    }
+
     uint8_t path[FILENAME_MAX] = { 0x00 };
-    bool is_offline = CLIParamStrToBuf(arg_get_str(ctx, 5), path, sizeof(path), &slen) == 0 && slen > 0;
-    bool show_images = arg_get_lit(ctx, 6);
+    bool is_offline = CLIParamStrToBuf(arg_get_str(ctx, 6), path, sizeof(path), &slen) == 0 && slen > 0;
+    bool show_images = arg_get_lit(ctx, 7);
     CLIParserFree(ctx);
 
     if ((IfPm3Iso14443() == false) && (is_offline == false)) {
@@ -2437,7 +3313,7 @@ static int CmdHFeMRTDInfo(const char *Cmd) {
         if (g_debugMode >= 2) {
             SetAPDULogging(true);
         }
-        int res = infoHF_EMRTD((char *)docnum, (char *)dob, (char *)expiry, BAC, !show_images);
+        int res = infoHF_EMRTD((char *)docnum, (char *)dob, (char *)expiry, (const char *)can, BAC, !show_images);
         SetAPDULogging(restore_apdu_logging);
         return res;
     }
